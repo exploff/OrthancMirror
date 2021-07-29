@@ -44,6 +44,8 @@
 #include "../ServerContext.h"
 
 #include <stdio.h>
+#include <thread>
+#include <atomic>
 
 #if defined(_MSC_VER)
 #define snprintf _snprintf
@@ -60,6 +62,8 @@ static const char* const KEY_ARCHIVE_SIZE_MB = "ArchiveSizeMB";
 static const char* const KEY_UNCOMPRESSED_SIZE = "UncompressedSize";
 static const char* const KEY_ARCHIVE_SIZE = "ArchiveSize";
 static const char* const KEY_TRANSCODE = "Transcode";
+
+static const int NB_THREAD = 3;
 
 
 namespace Orthanc
@@ -399,13 +403,19 @@ namespace Orthanc
       {
         assert(type_ == Type_WriteInstance);
       }
+
+      bool IsWriteInstance(){
+        return type_ == Type_WriteInstance;
+      }
         
       void Apply(HierarchicalZipWriter& writer,
                  ServerContext& context,
                  DicomDirWriter* dicomDir,
                  const std::string& dicomDirFolder,
                  bool transcode,
-                 DicomTransferSyntax transferSyntax) const
+                 DicomTransferSyntax transferSyntax,
+                 bool reading,
+                 std::string& content) const
       {
         switch (type_)
         {
@@ -419,68 +429,73 @@ namespace Orthanc
 
           case Type_WriteInstance:
           {
-            std::string content;
-
-            try
+            if (reading)
             {
-              context.ReadDicom(content, instanceId_);
-            }
-            catch (OrthancException& e)
-            {
-              LOG(WARNING) << "An instance was removed after the job was issued: " << instanceId_;
-              return;
-            }
-
-            //boost::this_thread::sleep(boost::posix_time::milliseconds(300));
-
-            writer.OpenFile(filename_.c_str());
-
-            bool transcodeSuccess = false;
-
-            std::unique_ptr<ParsedDicomFile> parsed;
-            
-            if (transcode)
-            {
-              // New in Orthanc 1.7.0
-              std::set<DicomTransferSyntax> syntaxes;
-              syntaxes.insert(transferSyntax);
-
-              IDicomTranscoder::DicomImage source, transcoded;
-              source.SetExternalBuffer(content);
-
-              if (context.Transcode(transcoded, source, syntaxes, true /* allow new SOP instance UID */))
+              try
               {
-                writer.Write(transcoded.GetBufferData(), transcoded.GetBufferSize());
+                context.ReadDicom(content, instanceId_);
+              }
+              catch (OrthancException& e)
+              {
+                LOG(WARNING) << "An instance was removed after the job was issued: " << instanceId_;
+                return;
+              }
+            }
+            else
+            {
+              //boost::this_thread::sleep(boost::posix_time::milliseconds(300));
+
+              writer.OpenFile(filename_.c_str());
+
+              bool transcodeSuccess = false;
+
+              std::unique_ptr<ParsedDicomFile> parsed;
+              
+              if (transcode)
+              {
+                // New in Orthanc 1.7.0
+                std::set<DicomTransferSyntax> syntaxes;
+                syntaxes.insert(transferSyntax);
+
+                IDicomTranscoder::DicomImage source, transcoded;
+                source.SetExternalBuffer(content);
+
+                if (context.Transcode(transcoded, source, syntaxes, true /* allow new SOP instance UID */))
+                {
+                  writer.Write(transcoded.GetBufferData(), transcoded.GetBufferSize());
+
+                  if (dicomDir != NULL)
+                  {
+                    std::unique_ptr<ParsedDicomFile> tmp(transcoded.ReleaseAsParsedDicomFile());
+                    dicomDir->Add(dicomDirFolder, filename_, *tmp);
+                  }
+                  
+                  transcodeSuccess = true;
+                }
+                else
+                {
+                  LOG(INFO) << "Cannot transcode instance " << instanceId_
+                            << " to transfer syntax: " << GetTransferSyntaxUid(transferSyntax);
+                }
+              }
+
+              if (!transcodeSuccess)
+              {
+                writer.Write(content);
 
                 if (dicomDir != NULL)
                 {
-                  std::unique_ptr<ParsedDicomFile> tmp(transcoded.ReleaseAsParsedDicomFile());
-                  dicomDir->Add(dicomDirFolder, filename_, *tmp);
+                  if (parsed.get() == NULL)
+                  {
+                    parsed.reset(new ParsedDicomFile(content));
+                  }
+
+                  dicomDir->Add(dicomDirFolder, filename_, *parsed);
                 }
-                
-                transcodeSuccess = true;
               }
-              else
-              {
-                LOG(INFO) << "Cannot transcode instance " << instanceId_
-                          << " to transfer syntax: " << GetTransferSyntaxUid(transferSyntax);
-              }
-            }
-
-            if (!transcodeSuccess)
-            {
-              writer.Write(content);
-
-              if (dicomDir != NULL)
-              {
-                if (parsed.get() == NULL)
-                {
-                  parsed.reset(new ParsedDicomFile(content));
-                }
-
-                dicomDir->Add(dicomDirFolder, filename_, *parsed);
-              }
-            }
+             
+            }        
+            
               
             break;
           }
@@ -502,14 +517,16 @@ namespace Orthanc
                        DicomDirWriter* dicomDir,
                        const std::string& dicomDirFolder,
                        bool transcode,
-                       DicomTransferSyntax transferSyntax) const
+                       DicomTransferSyntax transferSyntax,
+                       bool reading,
+                       std::string& content) const
     {
       if (index >= commands_.size())
       {
         throw OrthancException(ErrorCode_ParameterOutOfRange);
       }
 
-      commands_[index]->Apply(writer, context, dicomDir, dicomDirFolder, transcode, transferSyntax);
+      commands_[index]->Apply(writer, context, dicomDir, dicomDirFolder, transcode, transferSyntax, reading, content);
     }
       
   public:
@@ -527,6 +544,11 @@ namespace Orthanc
         assert(*it != NULL);
         delete *it;
       }
+    }
+
+    bool CommandIsWriteInstance(size_t index)
+    {
+      return commands_[index]->IsWriteInstance();
     }
 
     size_t GetSize() const
@@ -551,9 +573,11 @@ namespace Orthanc
                DicomDirWriter& dicomDir,
                const std::string& dicomDirFolder,
                bool transcode,
-               DicomTransferSyntax transferSyntax) const
+               DicomTransferSyntax transferSyntax,
+               bool reading,
+               std::string& content) const
     {
-      ApplyInternal(writer, context, index, &dicomDir, dicomDirFolder, transcode, transferSyntax);
+      ApplyInternal(writer, context, index, &dicomDir, dicomDirFolder, transcode, transferSyntax, reading, content);
     }
 
     // "archive" flavor (without DICOMDIR)
@@ -561,9 +585,11 @@ namespace Orthanc
                ServerContext& context,
                size_t index,
                bool transcode,
-               DicomTransferSyntax transferSyntax) const
+               DicomTransferSyntax transferSyntax,
+               bool reading,
+               std::string& content) const
     {
-      ApplyInternal(writer, context, index, NULL, "", transcode, transferSyntax);
+      ApplyInternal(writer, context, index, NULL, "", transcode, transferSyntax, reading, content);
     }
       
     void AddOpenDirectory(const std::string& filename)
@@ -782,6 +808,11 @@ namespace Orthanc
       }
     }
 
+    bool CurrentCommandIsWriteInstance(size_t index)
+    {
+      return commands_.CommandIsWriteInstance(index);
+    }
+
     void SetOutputFile(const std::string& path)
     {
       if (zip_.get() == NULL)
@@ -854,7 +885,9 @@ namespace Orthanc
 
     void RunStep(size_t index,
                  bool transcode,
-                 DicomTransferSyntax transferSyntax)
+                 DicomTransferSyntax transferSyntax,
+                 bool reading,
+                 std::string& content)
     {
       if (index > commands_.GetSize())
       {
@@ -864,32 +897,32 @@ namespace Orthanc
       {
         throw OrthancException(ErrorCode_BadSequenceOfCalls);
       }
-      else if (index == commands_.GetSize())
-      {
-        // Last step: Add the DICOMDIR
-        if (isMedia_)
-        {
-          assert(dicomDir_.get() != NULL);
-          std::string s;
-          dicomDir_->Encode(s);
-
-          zip_->OpenFile("DICOMDIR");
-          zip_->Write(s);
-        }
-      }
-      else
+      else if (index != commands_.GetSize())
       {
         if (isMedia_)
         {
           assert(dicomDir_.get() != NULL);
           commands_.Apply(*zip_, context_, index, *dicomDir_,
-                          MEDIA_IMAGES_FOLDER, transcode, transferSyntax);
+                          MEDIA_IMAGES_FOLDER, transcode, transferSyntax, reading, content);
         }
         else
         {
           assert(dicomDir_.get() == NULL);
-          commands_.Apply(*zip_, context_, index, transcode, transferSyntax);
+          commands_.Apply(*zip_, context_, index, transcode, transferSyntax, reading, content);
         }
+      }
+    }
+
+    void LastStep()
+    {
+      if (isMedia_)
+      {
+        assert(dicomDir_.get() != NULL);
+        std::string s;
+        dicomDir_->Encode(s);
+
+        zip_->OpenFile("DICOMDIR");
+        zip_->Write(s);
       }
     }
 
@@ -903,7 +936,18 @@ namespace Orthanc
       return commands_.GetUncompressedSize();
     }
   };
-
+  
+  struct Threads
+  {
+    std::thread        thread;
+    bool               boolRead;
+    std::string        content;
+    std::atomic<bool>  threadFinished;
+    int                threadCurrentStep;
+  };
+  
+  Threads threads_[NB_THREAD];
+  int threadsActive_;
 
   ArchiveJob::ArchiveJob(ServerContext& context,
                          bool isMedia,
@@ -919,6 +963,11 @@ namespace Orthanc
     transcode_(false),
     transferSyntax_(DicomTransferSyntax_LittleEndianImplicit)
   {
+    threadsActive_ = 0;
+    for (int i = 0; i < NB_THREAD; i++)
+    {
+      threads_[i].threadFinished = true;
+    }
   }
 
   
@@ -1083,7 +1132,14 @@ namespace Orthanc
         new DynamicTemporaryFile(asynchronousTarget_.release()));
     }
   }
-    
+
+  //method run by thread, read only DICOM
+  void ArchiveJob::RunStepReadInstance(const int numThread)
+  {
+    writer_->RunStep(threads_[numThread].threadCurrentStep, transcode_, transferSyntax_, threads_[numThread].boolRead, threads_[numThread].content);
+    threads_[numThread].threadFinished = true;
+  }
+  
 
   JobStepResult ArchiveJob::Step(const std::string& jobId)
   {
@@ -1095,16 +1151,84 @@ namespace Orthanc
       return JobStepResult::Success();
     }
     else
-    {
+    {      
       try
       {
-        writer_->RunStep(currentStep_, transcode_, transferSyntax_);
+        if (currentStep_ != writer_->GetStepsCount() - 1)
+        {
+          //If it is a Command to open / close a directory, we wait for the end of the active thread and we launch the step
+          if (!writer_->CurrentCommandIsWriteInstance(currentStep_))
+          {
+            for (int i = 0; i < threadsActive_; i++)
+            {
+              bool err = EndThreadIndexOf(i);
+              if(!err)
+              {
+                std::cout << "Error reading / writing the dicom via the thread\n";
+              }
+            }
+            writer_->RunStep(currentStep_, transcode_, transferSyntax_, threads_[threadsActive_].boolRead, threads_[threadsActive_].content);
+            threadsActive_ = 0;
+          }
+          else
+          {
+            //if the thread queue is not full we complete it
+            if (threadsActive_ < NB_THREAD)
+            {
+              threads_[threadsActive_].threadFinished = false;
+              threads_[threadsActive_].boolRead = true;
+              threads_[threadsActive_].threadCurrentStep = currentStep_;
+              threads_[threadsActive_].thread = std::thread(&ArchiveJob::RunStepReadInstance, this, threadsActive_);
+              threadsActive_++;
+            }
+            else
+            {
+              //if not, we loop until we find a terminated thread, we write the instance and start a new one
+              int threadFound = false;
+              int i = 0;
+              while (!threadFound)
+              {
+                if (threads_[i].threadFinished)
+                {
+                  bool err = EndThreadIndexOf(i);
+                  if(!err)
+                  {
+                    std::cout << "Error reading / writing the dicom via the thread\n";
+                  }
+                  // launch dicom reading thread
+                  threads_[i].threadFinished = false;
+                  threads_[i].threadCurrentStep = currentStep_;
+                  threads_[i].thread = std::thread(&ArchiveJob::RunStepReadInstance, this, i);
+                  threadFound = true;
+                }
+                i++;
+                i = i%3;
+              }
+            }
+          }
+        }
       }
       catch (Orthanc::OrthancException& e)
       {
         LOG(ERROR) << "Error while creating an archive: " << e.What();
         writer_->CancelStream();
         throw;
+      }
+      
+      //If this is the last step, we wait for all the threads to end
+      if (currentStep_ == writer_->GetStepsCount() - 1)
+      {
+        for (int i = 0; i < threadsActive_; i++)
+        {
+          bool err = EndThreadIndexOf(i);
+          if(!err)
+          {
+            std::cout << "Error reading / writing the dicom via the thread\n";
+          }
+        }   
+        //Run last step ADD DICOMDIR
+        writer_->LastStep();
+        threadsActive_ = 0;
       }
 
       currentStep_ ++;
@@ -1120,6 +1244,18 @@ namespace Orthanc
         return JobStepResult::Continue();
       }
     }
+  }
+
+  bool ArchiveJob::EndThreadIndexOf(const int threadNumber)
+  {
+    //end of dicom reading
+    threads_[threadNumber].thread.join();
+    //writing dicom
+    threads_[threadNumber].boolRead = false;
+    writer_->RunStep(threads_[threadNumber].threadCurrentStep, transcode_, transferSyntax_, threads_[threadNumber].boolRead, threads_[threadNumber].content);
+    threads_[threadNumber].boolRead = true;
+    threads_[threadNumber].content = "";
+    return true;
   }
 
 

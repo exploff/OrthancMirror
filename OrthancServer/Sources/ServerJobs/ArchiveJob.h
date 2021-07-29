@@ -100,6 +100,10 @@ namespace Orthanc
     virtual void Reset() ORTHANC_OVERRIDE;
 
     virtual void Start() ORTHANC_OVERRIDE;
+    
+    virtual void RunStepReadInstance(const int numThread);
+    
+    virtual bool EndThreadIndexOf(const int threadNumber);
 
     virtual JobStepResult Step(const std::string& jobId) ORTHANC_OVERRIDE;
 
